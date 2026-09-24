@@ -1,0 +1,16 @@
+{
+  "name": "hatggurd-abe-android",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hatggurd District Adventurer Bible Experience Android Application",
+  "scripts": {
+    "build": "echo Hatggurd ABE web application ready"
+  },
+  "dependencies": {
+    "@capacitor/core": "^8.0.0",
+    "@capacitor/android": "^8.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.0.0"
+  }
+}
