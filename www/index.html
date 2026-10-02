@@ -433,6 +433,23 @@ function wearTheIcon() {
     put("appManifest", url);
   } catch (e) { /* a manifest is a nicety; the app never depends on it */ }
 }
+/* ===============================================================  Android bridge
+   A browser can download a file and open a print dialog by itself. An Android WebView
+   cannot: it ignores the download attribute on a link, and window.print() does nothing
+   there. So when the app is wrapped as an APK, the host app injects ABE_NATIVE and the
+   app hands it the bytes instead. In a browser ABE_NATIVE is absent and nothing changes. */
+const NATIVE = (typeof window !== "undefined" && window.ABE_NATIVE) || null;
+function nativeCan(what) { return !!(NATIVE && typeof NATIVE[what] === "function"); }
+/* true inside an Android WebView (Capacitor, Cordova or a plain wrapper) */
+const IN_WEBVIEW = (() => {
+  try {
+    if (NATIVE) return true;
+    if (window.Capacitor || window.cordova) return true;
+    const ua = navigator.userAgent || "";
+    return /\bwv\b/.test(ua) || (/Android/.test(ua) && !/Chrome\/[.0-9]+ Mobile/.test(ua) && /Version\/[.0-9]+/.test(ua));
+  } catch (e) { return false; }
+})();
+
 /* ===================================================================== state */
 const KEY = "hatggurd_abe_2026_v2";
 const VER = "2.0";
@@ -526,10 +543,55 @@ function wakeAudio() {
 ["pointerdown", "touchstart", "keydown", "click"].forEach(ev =>
   document.addEventListener(ev, wakeAudio, {passive: true}));
 document.addEventListener("visibilitychange", () => { if (!document.hidden) wakeAudio(); });
-function soundWorks() { const ac = makeAC(); return !!ac && ac.state !== "closed"; }
+function soundWorks() { const ac = makeAC(); return !!(ac && ac.state !== "closed") || WAV_OK; }
+function soundHow() {
+  const ac = makeAC();
+  if (ac && ac.state !== "closed") return ac.state === "running" ? "Web Audio (running)" : "Web Audio (" + ac.state + ")";
+  return WAV_OK ? "sound clips" : "no sound on this device";
+}
+
+/* ---- the fallback: some Android WebViews give no Web Audio at all, so the same little
+   tunes are built as tiny WAV clips and played through an audio element instead. */
+let WAV_OK = true;
+const WAV_CACHE = {};
+function wavURI(freqs, dur, vol) {
+  const key = freqs.join("_") + "|" + dur + "|" + vol;
+  if (WAV_CACHE[key]) return WAV_CACHE[key];
+  const rate = 11025, per = Math.max(1, Math.round(dur * rate)), n = per * freqs.length;
+  const bytes = 44 + n, buf = new Array(bytes);
+  let o = 0;
+  const str = t => { for (let i = 0; i < t.length; i++) buf[o++] = t.charCodeAt(i); };
+  const u32 = v => { buf[o++] = v & 255; buf[o++] = v >> 8 & 255; buf[o++] = v >> 16 & 255; buf[o++] = v >> 24 & 255; };
+  const u16 = v => { buf[o++] = v & 255; buf[o++] = v >> 8 & 255; };
+  str("RIFF"); u32(36 + n); str("WAVE"); str("fmt "); u32(16); u16(1); u16(1);
+  u32(rate); u32(rate); u16(1); u16(8); str("data"); u32(n);
+  for (let k = 0; k < freqs.length; k++) {
+    for (let i = 0; i < per; i++) {
+      const fade = Math.min(1, i / 60) * Math.pow(1 - i / per, 1.6);
+      const v = Math.sin(2 * Math.PI * freqs[k] * i / rate) * vol * fade;
+      buf[o++] = Math.max(0, Math.min(255, Math.round(128 + v * 127)));
+    }
+  }
+  let bin = "";
+  for (let i = 0; i < bytes; i += 4096) bin += String.fromCharCode.apply(null, buf.slice(i, i + 4096));
+  const uri = "data:audio/wav;base64," + btoa(bin);
+  WAV_CACHE[key] = uri;
+  return uri;
+}
+function playWav(freqs, dur, vol) {
+  try {
+    const a = new Audio(wavURI(freqs, dur, vol));
+    a.volume = 1;
+    const pr = a.play();
+    if (pr && pr.catch) pr.catch(() => { WAV_OK = false; });
+    return true;
+  } catch (e) { WAV_OK = false; return false; }
+}
 function tone(freqs, dur = .12, type = "sine", vol = .12) {
   if (!S.sound) return;
-  try { const ac = makeAC(); if (!ac) return;
+  const ac0 = makeAC();
+  if (!ac0 || ac0.state === "closed") { playWav(freqs, dur, Math.min(.9, vol * 5)); return; }
+  try { const ac = ac0;
     if (ac.state === "suspended" && ac.resume) { try { ac.resume(); } catch (e) {} }
     AC = ac;
     let t = AC.currentTime;
@@ -960,7 +1022,25 @@ VIEWS.read = ({bk, ch, q}) => {
 
 "use strict";
 /* ===================================================================== printing */
+/* The whole page, ready to print on its own. An Android WebView has no print dialog of its
+   own, so the host app is handed a complete little document instead of being asked to
+   print this one. The styles are the page's own, so the sheet looks the same either way. */
+function printableDocument(bodyHTML, landscape) {
+  const css = Array.prototype.map.call(document.querySelectorAll("style"), s => s.textContent).join("\n");
+  return '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+    "<style>" + css + "</style></head><body class=\"printing" + (landscape ? " landscape" : "") + "\">" +
+    '<div id="printArea" style="display:block">' + bodyHTML + "</div></body></html>";
+}
 function printSheet(html, landscape) {
+  /* inside an APK: hand the sheet to Android's own print service */
+  if (nativeCan("printHtml")) {
+    try {
+      NATIVE.printHtml(printableDocument(html, landscape), landscape ? "landscape" : "portrait",
+                       "Hatggurd District ABE");
+      return;
+    } catch (e) { toast("The app could not reach the printer"); return; }
+  }
   const pa = document.getElementById("printArea");
   pa.innerHTML = html;
   document.body.classList.add("printing");
@@ -2685,7 +2765,16 @@ VIEWS.resources = () => {
 };
 async function saveFile(name) {
   const uri = RES[name]; if (!uri) { toast("That file is not in this copy of the app"); return; }
-  const bin = b64(uri.split(",")[1]);
+  const data = uri.split(",")[1];
+  /* inside an APK the host app writes the file, because a WebView ignores a download link */
+  if (nativeCan("saveFile")) {
+    try {
+      const where = NATIVE.saveFile(name, data, "application/pdf");
+      toast(where ? "Saved to " + where : "Saved to your Downloads folder");
+    } catch (e) { toast("The app could not save that file"); }
+    return;
+  }
+  const bin = b64(data);
   try {
     const dl = window.claude && window.claude.use ? await window.claude.use("downloads") : null;
     if (dl) { await dl.save({filename: name, data: new Blob([bin], {type: "application/pdf"})}); toast("Saved"); return; }
@@ -2700,8 +2789,15 @@ async function saveFile(name) {
 
 function openFile(name) {
   const uri = RES[name]; if (!uri) { toast("That file is not in this copy of the app"); return; }
+  const data = uri.split(",")[1];
+  /* inside an APK the host app opens the PDF in the phone's own reader, which can print it */
+  if (nativeCan("openFile")) {
+    try { NATIVE.openFile(name, data, "application/pdf"); }
+    catch (e) { toast("The app could not open that file"); }
+    return;
+  }
   try {
-    const url = URL.createObjectURL(new Blob([b64(uri.split(",")[1])], {type: "application/pdf"}));
+    const url = URL.createObjectURL(new Blob([b64(data)], {type: "application/pdf"}));
     const w = window.open(url, "_blank");
     if (!w) { toast("Your browser blocked the new tab \u2014 use Download instead"); }
     setTimeout(() => URL.revokeObjectURL(url), 60000);
@@ -2720,8 +2816,10 @@ VIEWS.settings = () => {
   <div class="panel" style="margin-top:1rem"><h2>Sound and voice</h2>
     <div class="row" style="margin-top:.5rem">
       <button class="btn ${S.sound ? "go" : "alt"}" id="snd">Sounds: ${S.sound ? "on" : "off"}</button>
-      <button class="btn ${S.voice ? "go" : "alt"}" id="vce">Reading aloud: ${S.voice ? "on" : "off"}</button></div>
-    <p class="note" style="margin-top:.4rem">Reading aloud uses the voice built into the device.</p></div>
+      <button class="btn ${S.voice ? "go" : "alt"}" id="vce">Reading aloud: ${S.voice ? "on" : "off"}</button>
+      <button class="btn alt" id="testSnd">Test the sound</button></div>
+    <p class="note" style="margin-top:.4rem" id="sndNote">Reading aloud uses the voice built into the device.
+      Turn the phone\u2019s media volume up, and take it off silent, or nothing will be heard.</p></div>
   <div class="panel" style="margin-top:1rem"><h2>About this app</h2>
     <p style="margin-top:.4rem"><b>${esc(A.app)}</b> \u2014 Adventurer Bible Experience ${A.year}.</p>
     <p style="margin-top:.4rem">${esc(A.devs)}</p>
@@ -2749,6 +2847,16 @@ VIEWS.settings = () => {
   const setFs = v => { S.fs = Math.max(.8, Math.min(1.5, +v.toFixed(2))); save(); render(); };
   $("#sm").onclick = () => setFs(S.fs - .1); $("#lg").onclick = () => setFs(S.fs + .1); $("#rs").onclick = () => setFs(1);
   $("#snd").onclick = () => { S.sound = !S.sound; save(); render(); };
+  $("#testSnd").onclick = () => {
+    wakeAudio();
+    const on = S.sound; S.sound = true;
+    sndOk(); setTimeout(sndWin, 350);
+    setTimeout(() => { S.sound = on;
+      const n = $("#sndNote");
+      if (n) n.innerHTML = "Sound is coming out through <b>" + esc(soundHow()) + "</b>. "
+        + "If you heard nothing, turn the media volume up and take the phone off silent.";
+    }, 900);
+  };
   $("#vce").onclick = () => { S.voice = !S.voice; save(); render(); };
   $("#clearStars").onclick = () => { if (!confirm("Clear every child\u2019s marks on this device?")) return;
     S.profiles.forEach(p => { p.papers = {}; p.games = {}; p.secs = 0; p.stats = {coloured: 0, read: [], fullSearch: 0}; p.badges = []; }); save(); toast("Cleared"); };
